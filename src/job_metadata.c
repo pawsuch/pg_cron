@@ -48,6 +48,9 @@
 #include "utils/varlena.h"
 #endif
 
+#include "executor/spi.h"
+#include "catalog/pg_type.h"
+
 #if (PG_VERSION_NUM < 120000)
 #define table_open(r, l) heap_open(r, l)
 #define table_close(r, l) heap_close(r, l)
@@ -58,6 +61,9 @@
 #define JOBS_TABLE_NAME "job"
 #define JOB_ID_INDEX_NAME "job_pkey"
 #define JOB_ID_SEQUENCE_NAME "cron.jobid_seq"
+#define JOB_RUN_DETAILS_TABLE_NAME "job_run_details"
+#define RUN_ID_SEQUENCE_NAME "cron.runid_seq"
+#define MAX_NUMBER_SPI_EXEC_ARGS 6
 
 
 /* forward declarations */
@@ -275,6 +281,43 @@ NextJobId(void)
 	return jobId;
 }
 
+int64
+NextRunId(void)
+{
+	text *sequenceName = NULL;
+	Oid sequenceId = InvalidOid;
+	List *sequenceNameList = NIL;
+	RangeVar *sequenceVar = NULL;
+	Datum sequenceIdDatum = InvalidOid;
+	Oid savedUserId = InvalidOid;
+	int savedSecurityContext = 0;
+	Datum jobIdDatum = 0;
+	int64 jobId = 0;
+	bool failOK = true;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	/* resolve relationId from passed in schema and relation name */
+	sequenceName = cstring_to_text(RUN_ID_SEQUENCE_NAME);
+	sequenceNameList = textToQualifiedNameList(sequenceName);
+	sequenceVar = makeRangeVarFromNameList(sequenceNameList);
+	sequenceId = RangeVarGetRelid(sequenceVar, NoLock, failOK);
+	sequenceIdDatum = ObjectIdGetDatum(sequenceId);
+
+	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+	SetUserIdAndSecContext(CronExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
+
+	/* generate new and unique colocation id from sequence */
+	jobIdDatum = DirectFunctionCall1(nextval_oid, sequenceIdDatum);
+
+	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+
+	jobId = DatumGetInt64(jobIdDatum);
+
+	return jobId;
+}
 
 /*
  * CronExtensionOwner returns the name of the user that owns the
@@ -467,7 +510,6 @@ CronJobRelationId(void)
 	return CachedCronJobRelationId;
 }
 
-
 /*
  * LoadCronJobList loads the current list of jobs from the
  * cron.job table and adds each job to the CronJobHash.
@@ -649,4 +691,246 @@ PgCronHasBeenLoaded(void)
 	extensionLoaded = extensionPresent && extensionScriptExecuted;
 
 	return extensionLoaded;
+}
+
+void
+InsertJobRunDetail(int64 runId, int64 *jobId, char *database, char *username, char *command, char *status)
+{
+	StringInfoData querybuf;
+	Oid argTypes[MAX_NUMBER_SPI_EXEC_ARGS];
+	Datum argValues[MAX_NUMBER_SPI_EXEC_ARGS];
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	if (!PgCronHasBeenLoaded() || RecoveryInProgress())
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		ereport(LOG,(errmsg("pg_cron not loaded/present or recovery in progress")));
+		return;
+	}
+
+	initStringInfo(&querybuf);
+
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+
+	appendStringInfo(&querybuf,
+		"insert into %s.%s (jobid, runid, database, username, command, status) values ($1,$2,$3,$4,$5,$6)",
+		CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME);
+
+	/* jobId */
+	argTypes[0] = INT8OID;
+	argValues[0] = Int64GetDatum(*jobId);
+
+	/* runId */
+	argTypes[1] = INT8OID;
+	argValues[1] = Int64GetDatum(runId);
+
+	/* database */
+	argTypes[2] = TEXTOID;
+	argValues[2] = CStringGetTextDatum(database);
+
+	/* username */
+	argTypes[3] = TEXTOID;
+	argValues[3] = CStringGetTextDatum(username);
+
+	/* command */
+	argTypes[4] = TEXTOID;
+	argValues[4] = CStringGetTextDatum(command);
+
+	/* status */
+	argTypes[5] = TEXTOID;
+	argValues[5] = CStringGetTextDatum(status);
+
+	pgstat_report_activity(STATE_RUNNING, querybuf.data);
+
+	if(SPI_execute_with_args(querybuf.data,
+		MAX_NUMBER_SPI_EXEC_ARGS, argTypes, argValues, NULL, false, 1) != SPI_OK_INSERT)
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+
+	pfree(querybuf.data);
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	pgstat_report_activity(STATE_IDLE, NULL);
+}
+
+void
+UpdateJobRunDetail(int64 runId, int32 *job_pid, char *status, char *return_message, TimestampTz *start_time,
+                                                                        TimestampTz *end_time)
+{
+	StringInfoData querybuf;
+	Oid argTypes[MAX_NUMBER_SPI_EXEC_ARGS];
+	Datum argValues[MAX_NUMBER_SPI_EXEC_ARGS];
+	int i;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	if (!PgCronHasBeenLoaded() || RecoveryInProgress())
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		ereport(LOG,(errmsg("pg_cron not loaded/present or recovery in progress")));
+		return;
+	}
+
+	initStringInfo(&querybuf);
+	i = 0;
+
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+
+	appendStringInfo(&querybuf,
+		"update %s.%s set", CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME);
+
+
+	/* add the fields to be updated */
+	if (job_pid != NULL) {
+		argTypes[i] = INT4OID;
+		argValues[i] = Int32GetDatum(*job_pid);
+		i++;
+		appendStringInfo(&querybuf, " job_pid = $%d,", i);
+	}
+
+	if (status != NULL)
+	{
+		argTypes[i] = TEXTOID;
+		argValues[i] = CStringGetTextDatum(status);
+		i++;
+
+		appendStringInfo(&querybuf, " status = $%d,", i);
+	}
+
+        if (return_message != NULL)
+	{
+		argTypes[i] = TEXTOID;
+		argValues[i] = CStringGetTextDatum(return_message);
+		i++;
+
+		appendStringInfo(&querybuf, " return_message = $%d,", i);
+	}
+
+        if (start_time != NULL)
+	{
+		argTypes[i] = TIMESTAMPTZOID;
+		argValues[i] = TimestampTzGetDatum(*start_time);
+		i++;
+
+		appendStringInfo(&querybuf, " start_time = $%d,", i);
+	}
+
+        if (end_time != NULL)
+	{
+		argTypes[i] = TIMESTAMPTZOID;
+		argValues[i] = TimestampTzGetDatum(*end_time);
+		i++;
+
+		appendStringInfo(&querybuf, " end_time = $%d,", i);
+	}
+
+	argTypes[i] = INT8OID;
+	argValues[i] = Int64GetDatum(runId);
+	i++;
+
+	/* remove the last comma */
+	querybuf.len--;
+	querybuf.data[querybuf.len] = '\0';
+
+	/* and add the where clause */
+	appendStringInfo(&querybuf, " where runid = $%d", i);
+
+	pgstat_report_activity(STATE_RUNNING, querybuf.data);
+
+	if(SPI_execute_with_args(querybuf.data,
+		i, argTypes, argValues, NULL, false, 1) != SPI_OK_UPDATE)
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+
+	pfree(querybuf.data);
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	pgstat_report_activity(STATE_IDLE, NULL);
+}
+
+void
+MarkPendingRunsAsFailed(void)
+{
+	StringInfoData querybuf;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	if (!PgCronHasBeenLoaded() || RecoveryInProgress())
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return;
+	}
+
+	initStringInfo(&querybuf);
+
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+
+	appendStringInfo(&querybuf,
+		"update %s.%s set status = '%s', return_message = 'server restarted' where status in ('%s','%s')"
+		, CRON_SCHEMA_NAME, JOB_RUN_DETAILS_TABLE_NAME, GetCronStatus(CRON_STATUS_FAILED), GetCronStatus(CRON_STATUS_STARTING), GetCronStatus(CRON_STATUS_RUNNING));
+
+
+	pgstat_report_activity(STATE_RUNNING, querybuf.data);
+
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_UPDATE)
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+
+	pfree(querybuf.data);
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	pgstat_report_activity(STATE_IDLE, NULL);
+}
+
+char *
+GetCronStatus(CronStatus cronstatus)
+{
+	char *statusDesc = "unknown status";
+
+	switch (cronstatus)
+	{
+	case CRON_STATUS_STARTING:
+		statusDesc = "starting";
+		break;
+	case CRON_STATUS_RUNNING:
+		statusDesc = "running";
+		break;
+	case CRON_STATUS_SENDING:
+		statusDesc = "sending";
+		break;
+	case CRON_STATUS_CONNECTING:
+		statusDesc = "connecting";
+		break;
+	case CRON_STATUS_SUCCEEDED:
+		statusDesc = "succeeded";
+		break;
+	case CRON_STATUS_FAILED:
+		statusDesc = "failed";
+		break;
+	default:
+		break;
+	}
+	return statusDesc;
 }
