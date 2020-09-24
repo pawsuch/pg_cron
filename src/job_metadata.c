@@ -63,7 +63,7 @@
 #define JOB_ID_SEQUENCE_NAME "cron.jobid_seq"
 #define JOB_RUN_DETAILS_TABLE_NAME "job_run_details"
 #define RUN_ID_SEQUENCE_NAME "cron.runid_seq"
-#define MAX_NUMBER_SPI_EXEC_ARGS 6
+#define MAX_NUMBER_SPI_EXEC_ARGS 8
 
 
 /* forward declarations */
